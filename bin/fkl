@@ -1,0 +1,546 @@
+#!/usr/bin/env fish
+# ==============================================================================
+# fkl (Fish Keybind Lab)
+# CLI tool to fix, diagnose, and test text-editing keybindings in Fish shell.
+# ==============================================================================
+
+set -g FKL_VERSION "1.0.0"
+set -g FKL_BIN (realpath (status filename))
+set -g FKL_ROOT (cd (dirname "$FKL_BIN")/..; and pwd)
+set -g FKL_PRESETS_DIR "$FKL_ROOT/presets"
+set -g FKL_SANDBOX_DIR "$FKL_ROOT/.sandbox"
+
+set -g FISH_CONFIG_DIR "$HOME/.config/fish"
+if set -q XDG_CONFIG_HOME; and test -n "$XDG_CONFIG_HOME"
+    set -g FISH_CONFIG_DIR "$XDG_CONFIG_HOME/fish"
+end
+set -g FKL_CONFD_FILE "$FISH_CONFIG_DIR/conf.d/fish-keybind-lab.fish"
+set -g USER_CONFIG_FILE "$FISH_CONFIG_DIR/config.fish"
+set -g USER_BINDINGS_FUNC "$FISH_CONFIG_DIR/functions/fish_user_key_bindings.fish"
+
+# ------------------------------------------------------------------------------
+# UI Helpers
+# ------------------------------------------------------------------------------
+function _fkl_header -a title
+    set_color --bold cyan
+    echo "==> $title"
+    set_color normal
+end
+
+function _fkl_ok -a msg
+    set_color --bold green
+    printf "  [OK]      "
+    set_color normal
+    echo "$msg"
+end
+
+function _fkl_warn -a msg
+    set_color --bold yellow
+    printf "  [WARN]    "
+    set_color normal
+    echo "$msg"
+end
+
+function _fkl_err -a msg
+    set_color --bold red
+    printf "  [MISSING] "
+    set_color normal
+    echo "$msg"
+end
+
+function _fkl_info -a msg
+    set_color --bold blue
+    printf "  [INFO]    "
+    set_color normal
+    echo "$msg"
+end
+
+# ------------------------------------------------------------------------------
+# Help
+# ------------------------------------------------------------------------------
+function cmd_help
+    set_color --bold cyan
+    echo "fkl (Fish Keybind Lab) v$FKL_VERSION"
+    set_color normal
+    echo "Fix, diagnose, and test text-editing keybindings in the Fish shell."
+    echo ""
+    set_color --bold
+    echo "USAGE:"
+    set_color normal
+    echo "  ./fkl <command> [options]"
+    echo ""
+    set_color --bold
+    echo "COMMANDS:"
+    set_color normal
+    echo "  status                 Inspect active editing keybindings and conf.d installation"
+    echo "  list                   List available keybinding presets and their status"
+    echo "  install [presets...]   Install presets into ~/.config/fish/conf.d/ (default: word-deletion)"
+    echo "                         Options: --all (install all presets), --clean-legacy"
+    echo "  uninstall              Remove fish-keybind-lab from ~/.config/fish/conf.d/"
+    echo "  sandbox [presets...]   Launch an isolated Fish shell to test keybindings safely"
+    echo "  diff                   Compare your active interactive bindings against Fish defaults"
+    echo "  reader                 Launch fish_key_reader with a reference table of escape codes"
+    echo "  help                   Show this help message"
+    echo ""
+    set_color --bold
+    echo "EXAMPLES:"
+    set_color normal
+    echo "  ./fkl status                       # Check if Ctrl+Backspace, Ctrl+Delete, etc. work"
+    echo "  ./fkl list                         # Show available presets (word-deletion, etc.)"
+    echo "  ./fkl install                      # Install word-deletion preset to conf.d/"
+    echo "  ./fkl install --all                # Install word-deletion, word-navigation & line-editing"
+    echo "  ./fkl install --all --clean-legacy # Install to conf.d/ and clean old config.fish block"
+    echo "  ./fkl sandbox                      # Test all presets in a temporary isolated Fish session"
+    echo "  ./fkl diff                         # Show custom/overridden bindings vs Fish defaults"
+    echo "  ./fkl reader                       # Inspect raw escape sequences sent by your terminal"
+end
+
+# ------------------------------------------------------------------------------
+# Helper: Dump full interactive bindings cleanly (ignoring startup banners)
+# ------------------------------------------------------------------------------
+function _dump_bindings -a mode
+    if test "$mode" = "default"
+        fish --no-config -i -c "__fish_config_interactive >/dev/null 2>&1; bind" </dev/null 2>/dev/null \
+            | grep '^bind ' \
+            | string replace -a '\~' '~'
+    else
+        fish -i -c "__fish_config_interactive >/dev/null 2>&1; bind" </dev/null 2>/dev/null \
+            | grep '^bind ' \
+            | string replace -a '\~' '~'
+    end
+end
+
+# ------------------------------------------------------------------------------
+# Helper: Check a binding in an interactive dump
+# ------------------------------------------------------------------------------
+function _check_binding -a label expected_action dump_file
+    set -l seqs $argv[4..-1]
+    set -l matched_seqs
+    set -l has_custom 0
+
+    for seq in $seqs
+        set -l escaped_seq (string escape --style=regex -- "$seq")
+        if grep -Eq "^bind (-M insert )?$escaped_seq $expected_action\$" "$dump_file" 2>/dev/null
+            set -a matched_seqs "$seq"
+            set has_custom 1
+        else if grep -Eq "^bind --preset (-M insert )?$escaped_seq $expected_action\$" "$dump_file" 2>/dev/null
+            set -a matched_seqs "$seq"
+        end
+    end
+
+    if test (count $matched_seqs) -gt 0
+        set -l joined (string join ", " $matched_seqs)
+        set -l source_tag "default"
+        if test $has_custom -eq 1
+            set source_tag "custom"
+        end
+        _fkl_ok (printf "%-18s -> %-20s [%s: %s]" "$label" "$expected_action" "$source_tag" "$joined")
+        return 0
+    else
+        set -l joined (string join " or " $seqs)
+        _fkl_err (printf "%-18s -> NOT bound to %s (expected %s)" "$label" "$expected_action" "$joined")
+        return 1
+    end
+end
+
+# ------------------------------------------------------------------------------
+# Command: status
+# ------------------------------------------------------------------------------
+function cmd_status
+    _fkl_header "Interactive Session Editing Keybindings"
+    echo ""
+
+    set -l tmp_dump (mktemp)
+    _dump_bindings "current" > "$tmp_dump"
+
+    echo "  Word Deletion:"
+    _check_binding "Ctrl + Backspace" "backward-kill-word" "$tmp_dump" '\b' '\cH' '\e\[127\;5u'
+    _check_binding "Ctrl + Delete"    "kill-word"          "$tmp_dump" '\e\[3\;5~'
+
+    echo ""
+    echo "  Word Navigation:"
+    _check_binding "Ctrl + Left"      "backward-word"      "$tmp_dump" '\e\[1\;5D' '\e\[5D' '\eOd'
+    _check_binding "Ctrl + Right"     "forward-word"       "$tmp_dump" '\e\[1\;5C' '\e\[5C' '\eOc'
+
+    echo ""
+    echo "  Line Navigation & Deletion:"
+    _check_binding "Home"             "beginning-of-line"  "$tmp_dump" '\e\[H' '\eOH' '\e\[1~'
+    _check_binding "End"              "end-of-line"        "$tmp_dump" '\e\[F' '\eOF' '\e\[4~'
+    _check_binding "Ctrl + U"         "backward-kill-line" "$tmp_dump" '\cu'
+    _check_binding "Ctrl + K"         "kill-line"          "$tmp_dump" '\ck'
+
+    rm -f "$tmp_dump"
+
+    echo ""
+    _fkl_header "Configuration & Persistence"
+    echo ""
+
+    if test -f "$FKL_CONFD_FILE"
+        set -l active_presets (grep '^# @installed-presets:' "$FKL_CONFD_FILE" | string replace '# @installed-presets: ' '')
+        if test -z "$active_presets"
+            set active_presets "custom"
+        end
+        _fkl_ok "Managed config installed: $FKL_CONFD_FILE (presets: $active_presets)"
+    else
+        _fkl_warn "Managed config not installed ($FKL_CONFD_FILE)"
+        echo "            Run './fkl install' (or './fkl install --all') to manage via conf.d/."
+    end
+
+    # Detect legacy block in ~/.config/fish/config.fish
+    if test -f "$USER_CONFIG_FILE"
+        if grep -Eq "# Bindings for word deletion|Restored by fish-keybind-lab" "$USER_CONFIG_FILE" 2>/dev/null
+            _fkl_warn "Legacy inline bindings found in $USER_CONFIG_FILE"
+            echo "            Run './fkl install --clean-legacy' to migrate cleanly to conf.d/."
+        end
+    end
+
+    if test -f "$USER_BINDINGS_FUNC"
+        _fkl_info "Custom function detected at $USER_BINDINGS_FUNC"
+    end
+    echo ""
+end
+
+# ------------------------------------------------------------------------------
+# Command: list
+# ------------------------------------------------------------------------------
+function cmd_list
+    _fkl_header "Available Editing Presets"
+    echo ""
+
+    set -l installed_list ""
+    if test -f "$FKL_CONFD_FILE"
+        set installed_list (grep '^# @installed-presets:' "$FKL_CONFD_FILE" | string replace '# @installed-presets: ' '')
+    end
+
+    for file in "$FKL_PRESETS_DIR"/*.fish
+        set -l name (basename "$file" .fish)
+        set -l desc (grep '^# @description:' "$file" | string replace '# @description: ' '')
+        set -l badge "[ ]"
+        set -l color normal
+
+        if contains -- "$name" (string split " " "$installed_list")
+            set badge "[✓]"
+            set color green
+        end
+
+        set_color --bold $color
+        printf "  %s %-18s" "$badge" "$name"
+        set_color normal
+        echo " - $desc"
+    end
+    echo ""
+    echo "Use './fkl install <preset...>' or './fkl install --all' to enable presets."
+    echo ""
+end
+
+# ------------------------------------------------------------------------------
+# Helper: Clean legacy config.fish block
+# ------------------------------------------------------------------------------
+function _clean_legacy_config
+    if not test -f "$USER_CONFIG_FILE"
+        return 0
+    end
+
+    if not grep -Eq "# Bindings for word deletion|Restored by fish-keybind-lab" "$USER_CONFIG_FILE" 2>/dev/null
+        return 0
+    end
+
+    set -l timestamp (date +%Y%m%d_%H%M%S)
+    set -l backup_file "$USER_CONFIG_FILE.bak.$timestamp"
+    cp "$USER_CONFIG_FILE" "$backup_file"
+    _fkl_info "Backed up $USER_CONFIG_FILE -> $backup_file"
+
+    set -l tmp_clean (mktemp)
+    set -l skip 0
+    set -l in_if 0
+
+    while read -l line
+        if string match -rq '^# Bindings for word deletion' -- "$line"
+            set skip 1
+            continue
+        end
+        if test $skip -eq 1
+            if test $in_if -eq 1
+                if string match -rq '^end$' -- "$line"
+                    set in_if 0
+                    set skip 0
+                end
+                continue
+            end
+            if string match -rq '^if bind -M insert' -- "$line"
+                set in_if 1
+                continue
+            end
+            if string match -rq '^bind .*(backward-kill-word|kill-word)' -- "$line"
+                continue
+            end
+            if string match -rq '^# (={10,}|Word Deletion Presets|These bindings|- Ctrl|Ctrl \+|Most terminal|Standard ANSI|Vi-mode support)' -- "$line"
+                continue
+            end
+            if string match -rq '^#$' -- "$line"
+                continue
+            end
+            set skip 0
+        end
+        echo "$line" >> "$tmp_clean"
+    end < "$backup_file"
+
+    mv "$tmp_clean" "$USER_CONFIG_FILE"
+    _fkl_ok "Removed legacy inline bindings from $USER_CONFIG_FILE"
+end
+
+# ------------------------------------------------------------------------------
+# Command: install
+# ------------------------------------------------------------------------------
+function cmd_install
+    set -l presets_to_install
+    set -l clean_legacy 0
+    set -l install_all 0
+
+    for arg in $argv
+        switch "$arg"
+            case --all -a
+                set install_all 1
+            case --clean-legacy --migrate
+                set clean_legacy 1
+            case --force -f
+                continue
+            case '-*'
+                _fkl_err "Unknown option: $arg"
+                exit 1
+            case '*'
+                set -l normalized (string replace -a '_' '-' "$arg")
+                if not test -f "$FKL_PRESETS_DIR/$normalized.fish"
+                    _fkl_err "Preset '$arg' not found in $FKL_PRESETS_DIR"
+                    exit 1
+                end
+                set -a presets_to_install "$normalized"
+        end
+    end
+
+    if test $install_all -eq 1
+        set presets_to_install
+        for file in "$FKL_PRESETS_DIR"/*.fish
+            set -a presets_to_install (basename "$file" .fish)
+        end
+    else if test (count $presets_to_install) -eq 0
+        set presets_to_install "word-deletion"
+    end
+
+    _fkl_header "Installing Keybinding Presets"
+    echo ""
+
+    mkdir -p (dirname "$FKL_CONFD_FILE")
+
+    set -l joined_presets (string join " " $presets_to_install)
+
+    begin
+        echo "# =============================================================================="
+        echo "# Auto-generated by fish-keybind-lab (fkl)"
+        echo "# @installed-presets: $joined_presets"
+        echo "# Do not edit manually; run 'fkl install' or 'fkl uninstall' to manage."
+        echo "# =============================================================================="
+        echo ""
+        echo "status is-interactive; or exit"
+        echo ""
+        for preset in $presets_to_install
+            echo "# --- Preset: $preset ---"
+            grep -v '^status is-interactive' "$FKL_PRESETS_DIR/$preset.fish"
+            echo ""
+        end
+    end > "$FKL_CONFD_FILE"
+
+    _fkl_ok "Installed presets ($joined_presets) -> $FKL_CONFD_FILE"
+
+    if test $clean_legacy -eq 1
+        _clean_legacy_config
+    else if test -f "$USER_CONFIG_FILE"; and grep -Eq "# Bindings for word deletion|Restored by fish-keybind-lab" "$USER_CONFIG_FILE" 2>/dev/null
+        _fkl_warn "Legacy inline bindings detected in $USER_CONFIG_FILE."
+        echo "            Run './fkl install --clean-legacy' to remove them from config.fish."
+    end
+
+    echo ""
+    _fkl_info "New Fish sessions will load these bindings automatically."
+    _fkl_info "To apply them immediately in your current Fish shell, run:"
+    echo ""
+    set_color --bold cyan
+    echo "    source $FKL_CONFD_FILE"
+    set_color normal
+    echo ""
+end
+
+# ------------------------------------------------------------------------------
+# Command: uninstall
+# ------------------------------------------------------------------------------
+function cmd_uninstall
+    _fkl_header "Uninstalling Fish Keybind Lab"
+    echo ""
+
+    if test -f "$FKL_CONFD_FILE"
+        rm -f "$FKL_CONFD_FILE"
+        _fkl_ok "Removed $FKL_CONFD_FILE"
+    else
+        _fkl_info "Nothing to remove ($FKL_CONFD_FILE does not exist)."
+    end
+
+    if test -f "$USER_CONFIG_FILE"; and grep -Eq "# Bindings for word deletion|Restored by fish-keybind-lab" "$USER_CONFIG_FILE" 2>/dev/null
+        _fkl_warn "Legacy inline bindings still exist in $USER_CONFIG_FILE."
+        echo "            Pass '--clean-legacy' if you also want to remove them."
+        if contains -- "--clean-legacy" $argv
+            _clean_legacy_config
+        end
+    end
+    echo ""
+end
+
+# ------------------------------------------------------------------------------
+# Command: sandbox
+# ------------------------------------------------------------------------------
+function cmd_sandbox
+    set -l presets_to_load $argv
+    if test (count $presets_to_load) -eq 0
+        for file in "$FKL_PRESETS_DIR"/*.fish
+            set -a presets_to_load (basename "$file" .fish)
+        end
+    end
+
+    set -l sandbox_fish_dir "$FKL_SANDBOX_DIR/fish"
+    mkdir -p "$sandbox_fish_dir"
+
+    set -l joined_presets (string join ", " $presets_to_load)
+
+    begin
+        echo "# Isolated Sandbox Configuration (generated by fkl)"
+        echo "function fish_greeting"
+        echo "    set_color --bold cyan"
+        echo "    echo '╭─────────────────────────────────────────────────────────────────╮'"
+        echo "    echo '│  Fish Keybind Lab — Isolated Sandbox Session                    │'"
+        echo "    echo '╰─────────────────────────────────────────────────────────────────╯'"
+        echo "    set_color normal"
+        echo "    echo '  Loaded presets : $joined_presets'"
+        echo "    echo '  Config path    : $sandbox_fish_dir/config.fish (isolated)'"
+        echo "    echo ''"
+        echo "    echo '  Try these shortcuts on any typed command:'"
+        echo "    echo '    • Ctrl+Backspace : Delete word left    (backward-kill-word)'"
+        echo "    echo '    • Ctrl+Delete    : Delete word right   (kill-word)'"
+        echo "    echo '    • Ctrl+Left/Right: Jump across words   (backward/forward-word)'"
+        echo "    echo '    • Home / End     : Jump start/end line (beginning/end-of-line)'"
+        echo "    echo '    • Type \"exit\" to leave the sandbox.'"
+        echo "    echo ''"
+        echo "end"
+        echo ""
+        for preset in $presets_to_load
+            set -l normalized (string replace -a '_' '-' "$preset")
+            if test -f "$FKL_PRESETS_DIR/$normalized.fish"
+                echo "source \"$FKL_PRESETS_DIR/$normalized.fish\""
+            end
+        end
+    end > "$sandbox_fish_dir/config.fish"
+
+    _fkl_info "Starting isolated Fish session (XDG_CONFIG_HOME=$FKL_SANDBOX_DIR)..."
+    XDG_CONFIG_HOME="$FKL_SANDBOX_DIR" fish
+end
+
+# ------------------------------------------------------------------------------
+# Command: diff
+# ------------------------------------------------------------------------------
+function cmd_diff
+    _fkl_header "Interactive Keybindings Diff (Factory Defaults vs Active)"
+    echo ""
+
+    set -l tmp_default (mktemp)
+    set -l tmp_current (mktemp)
+
+    _dump_bindings "default" | sort -u > "$tmp_default"
+    _dump_bindings "current" | sort -u > "$tmp_current"
+
+    set -l added (comm -13 "$tmp_default" "$tmp_current")
+    if not contains -- "--all" $argv
+        set added (printf "%s\n" $added | grep -v '^bind --preset ' 2>/dev/null)
+    end
+    set -l removed (comm -23 "$tmp_default" "$tmp_current")
+
+    if test (count $added) -gt 0
+        set_color --bold green
+        echo "Added or Custom Bindings ("(count $added)"):"
+        set_color normal
+        for line in $added
+            echo "  + $line"
+        end
+        echo ""
+    end
+
+    if test (count $removed) -gt 0
+        set_color --bold yellow
+        echo "Overridden Default Bindings ("(count $removed)"):"
+        set_color normal
+        for line in $removed
+            echo "  - $line"
+        end
+        echo ""
+    end
+
+    if test (count $added) -eq 0 -a (count $removed) -eq 0
+        _fkl_info "Your interactive keybindings match Fish factory defaults."
+        echo ""
+    end
+
+    rm -f "$tmp_default" "$tmp_current"
+end
+
+# ------------------------------------------------------------------------------
+# Command: reader
+# ------------------------------------------------------------------------------
+function cmd_reader
+    _fkl_header "Terminal Key Sequence Inspector (fish_key_reader)"
+    echo ""
+    echo "  Common expected sequences in Fish:"
+    echo "  ┌────────────────────┬──────────────────────────┬──────────────────────┐"
+    echo "  │ Key Combination    │ Typical Escape Sequence  │ Target Fish Action   │"
+    echo "  ├────────────────────┼──────────────────────────┼──────────────────────┤"
+    echo "  │ Ctrl + Backspace   │ \b, \cH, or \e[127;5u    │ backward-kill-word   │"
+    echo "  │ Ctrl + Delete      │ \e[3;5~                  │ kill-word            │"
+    echo "  │ Ctrl + Left Arrow  │ \e[1;5D, \e[5D, or \eOd  │ backward-word        │"
+    echo "  │ Ctrl + Right Arrow │ \e[1;5C, \e[5C, or \eOc  │ forward-word         │"
+    echo "  │ Home / End         │ \e[H / \e[F (\eOH/\eOF)  │ beginning/end-of-line│"
+    echo "  └────────────────────┴──────────────────────────┴──────────────────────┘"
+    echo ""
+    _fkl_info "Press any key combination to inspect its sequence (Ctrl+C or Ctrl+D to exit):"
+    echo ""
+    fish_key_reader
+end
+
+# ------------------------------------------------------------------------------
+# Main Dispatcher
+# ------------------------------------------------------------------------------
+set -l subcommand $argv[1]
+if test -z "$subcommand"
+    set subcommand "help"
+end
+set -l subargs $argv[2..-1]
+
+switch "$subcommand"
+    case status check
+        cmd_status $subargs
+    case list presets ls
+        cmd_list $subargs
+    case install restore apply
+        cmd_install $subargs
+    case uninstall remove clean
+        cmd_uninstall $subargs
+    case sandbox test
+        cmd_sandbox $subargs
+    case diff
+        cmd_diff $subargs
+    case reader inspect
+        cmd_reader $subargs
+    case version --version -v
+        echo "fkl (Fish Keybind Lab) v$FKL_VERSION"
+    case help --help -h
+        cmd_help
+    case '*'
+        _fkl_err "Unknown command: '$subcommand'"
+        echo ""
+        cmd_help
+        exit 1
+end
